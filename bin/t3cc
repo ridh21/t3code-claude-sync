@@ -1,0 +1,97 @@
+#!/usr/bin/env node
+// t3cc: continue a T3 Code thread in the Claude Code CLI (and list them).
+//   t3cc <threadId>         cd into the thread's folder and run `claude --resume <session>`
+//   t3cc --print <threadId> print that command instead of running it
+//   t3cc list [dir]         list T3 Claude threads for a folder (default: current dir)
+// Reads T3's database read-only; never writes to it.
+const { execFileSync, spawnSync } = require("node:child_process");
+const os = require("node:os");
+const path = require("node:path");
+const fs = require("node:fs");
+
+const HOME = process.env.T3CODE_HOME || path.join(os.homedir(), ".t3");
+const DB = path.join(HOME, "userdata", "statev2.sqlite");
+const SETTINGS = path.join(HOME, "userdata", "settings.json");
+
+function sql(query, params = []) {
+  let q = query;
+  for (const p of params) q = q.replace("?", `'${String(p).replace(/'/g, "''")}'`);
+  const out = execFileSync("sqlite3", ["-readonly", "-json", DB, q], { encoding: "utf8", maxBuffer: 64 << 20 });
+  return out.trim() ? JSON.parse(out) : [];
+}
+
+function expand(p) {
+  return p && p.startsWith("~") ? path.join(os.homedir(), p.slice(1)) : p;
+}
+
+function instanceHome(instanceId) {
+  try {
+    const s = JSON.parse(fs.readFileSync(SETTINGS, "utf8"));
+    const inst = s.providerInstances?.[instanceId];
+    return expand(inst?.config?.homePath || "") || null;
+  } catch { return null; }
+}
+
+function resolve(threadId) {
+  const [t] = sql(
+    `select t.thread_id, t.title, t.active_provider_thread_id as apt,
+            json_extract(t.payload_json,'$.worktreePath') as worktree, p.workspace_root as root
+       from orchestration_v2_projection_threads t
+       join projection_projects p on p.project_id = t.project_id
+      where t.thread_id = ?`, [threadId]);
+  if (!t) throw new Error(`No T3 thread '${threadId}'.`);
+  const pts = sql(
+    `select provider_thread_id as id, driver, provider_instance_id as inst,
+            json_extract(payload_json,'$.nativeThreadRef.nativeId') as native, last_run_ordinal as ord, updated_at
+       from orchestration_v2_projection_provider_threads
+      where thread_id = ? and driver = 'claudeAgent' and json_extract(payload_json,'$.nativeThreadRef.nativeId') is not null
+      order by (provider_thread_id = ?) desc, coalesce(last_run_ordinal,0) desc, updated_at desc`, [threadId, t.apt || ""]);
+  const pt = pts[0];
+  if (!pt) throw new Error(`Thread '${t.title}' has no Claude Code session (it may use another provider).`);
+  return { title: t.title, cwd: t.worktree || t.root, session: pt.native, home: instanceHome(pt.inst), instance: pt.inst };
+}
+
+function shq(s) { return `'${String(s).replace(/'/g, "'\\''")}'`; }
+
+function command(r) {
+  const env = r.home ? `CLAUDE_CONFIG_DIR=${shq(r.home)} ` : "";
+  return `cd ${shq(r.cwd)} && ${env}claude --resume ${shq(r.session)}`;
+}
+
+function list(dir) {
+  const root = path.resolve(dir || process.cwd());
+  const rows = sql(
+    `select t.thread_id, t.title, t.updated_at, coalesce(json_extract(t.payload_json,'$.worktreePath'), p.workspace_root) as cwd
+       from orchestration_v2_projection_threads t
+       join projection_projects p on p.project_id = t.project_id
+      where t.deleted_at is null and t.archived_at is null
+        and (p.workspace_root = ? or json_extract(t.payload_json,'$.worktreePath') = ?)
+        and exists (select 1 from orchestration_v2_projection_provider_threads pt
+                     where pt.thread_id = t.thread_id and pt.driver = 'claudeAgent')
+      order by t.updated_at desc limit 50`, [root, root]);
+  if (!rows.length) return console.log(`No T3 Claude threads for ${root}`);
+  for (const r of rows) console.log(`${r.updated_at.slice(0, 16).replace("T", " ")}  ${r.title}\n    t3cc ${shq(r.thread_id)}`);
+}
+
+try {
+  const args = process.argv.slice(2);
+  if (!args.length || args[0] === "-h" || args[0] === "--help") {
+    console.log("usage: t3cc <threadId> | t3cc --print <threadId> | t3cc list [dir]");
+  } else if (args[0] === "list") {
+    list(args[1]);
+  } else {
+    const print = args[0] === "--print";
+    const r = resolve(print ? args[1] : args[0]);
+    const cmd = command(r);
+    if (print) console.log(cmd);
+    else {
+      console.error(`Resuming "${r.title}" in ${r.cwd}`);
+      // Interactive zsh so shell functions such as cswitch's `claude` apply.
+      const res = spawnSync(process.env.SHELL || "/bin/zsh", ["-ic", cmd], { stdio: "inherit" });
+      process.exit(res.status ?? 0);
+    }
+  }
+} catch (e) {
+  console.error(`t3cc: ${e.message}`);
+  process.exit(1);
+}
